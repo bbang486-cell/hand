@@ -941,25 +941,51 @@
       const speed = Math.hypot(hvx, hvy);
 
       if(grabbedBottle){
-        if(!isGrabbing){
-          // 손만 펴면 무조건 날아감 — 가장 가까운 경계 방향으로
+        // 던지기 트리거 — 두 가지 중 하나라도 만족하면 던짐:
+        // (1) 손을 펴거나, (2) 손을 살짝이라도 움직이면
+        const SMALL_MOVE_THRESHOLD = 2.5;
+        const shouldThrow = !isGrabbing || speed > SMALL_MOVE_THRESHOLD;
+
+        if(shouldThrow){
           grabbedBottle.removing = true;
           grabbedBottle.removeProgress = 0;
 
+          const throwPower = 24;
           const bx = grabbedBottle.x, by = grabbedBottle.y;
-          const toLeft = bx, toRight = w - bx, toTop = by;
-          const minEdge = Math.min(toLeft, toRight, toTop);
-          const throwPower = 22;
 
-          if(minEdge === toLeft){
-            grabbedBottle.vx = -throwPower;
-            grabbedBottle.vy = (Math.random() - 0.5) * 4;
-          } else if(minEdge === toRight){
-            grabbedBottle.vx = throwPower;
-            grabbedBottle.vy = (Math.random() - 0.5) * 4;
+          // 손 움직임 방향이 있으면 그 방향으로, 없으면 가장 가까운 경계로
+          if(speed > 0.8){
+            const angle = Math.atan2(hvy, hvx);
+            grabbedBottle.vx = Math.cos(angle) * throwPower;
+            grabbedBottle.vy = Math.sin(angle) * throwPower;
+
+            // 움직임 방향이 화면 안쪽을 향하면 가장 가까운 경계로 보정
+            const toLeft = bx, toRight = w - bx, toTop = by;
+            const minEdge = Math.min(toLeft, toRight, toTop);
+            const heading = {
+              left: grabbedBottle.vx < -5 && toLeft < 400,
+              right: grabbedBottle.vx > 5 && toRight < 400,
+              top: grabbedBottle.vy < -5 && toTop < 400
+            };
+            if(!heading.left && !heading.right && !heading.top){
+              if(minEdge === toLeft) grabbedBottle.vx = -throwPower;
+              else if(minEdge === toRight) grabbedBottle.vx = throwPower;
+              else grabbedBottle.vy = -throwPower;
+            }
           } else {
-            grabbedBottle.vx = (Math.random() - 0.5) * 4;
-            grabbedBottle.vy = -throwPower;
+            // 거의 안 움직였으면 가장 가까운 경계로
+            const toLeft = bx, toRight = w - bx, toTop = by;
+            const minEdge = Math.min(toLeft, toRight, toTop);
+            if(minEdge === toLeft){
+              grabbedBottle.vx = -throwPower;
+              grabbedBottle.vy = (Math.random() - 0.5) * 4;
+            } else if(minEdge === toRight){
+              grabbedBottle.vx = throwPower;
+              grabbedBottle.vy = (Math.random() - 0.5) * 4;
+            } else {
+              grabbedBottle.vx = (Math.random() - 0.5) * 4;
+              grabbedBottle.vy = -throwPower;
+            }
           }
 
           grabbedBottle.vrot = (Math.random() - 0.5) * 0.4;
@@ -970,7 +996,7 @@
         }
       } else if(isGrabbing){
         let closest = null;
-        let minDist = 70;
+        let minDist = 100; // 잡기 반경 확대 (70 → 100)
         for(const b of bottles){
           if(b.grabbed || b.removing) continue;
           const d = Math.hypot(b.x - handPos.x, b.y - handPos.y);
