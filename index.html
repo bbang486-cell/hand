@@ -340,16 +340,16 @@
     };
   }
 
-  // 게임 시작 시 초기 페트병 5개 — 이미 쌓인 상태로 배치
+  // 게임 시작 시 초기 페트병 7개 — 이미 쌓인 상태로 배치
   function spawnInitialBottles(w, h){
     const whaleH = getWhaleHeight(w, h);
     const whaleTop = h - whaleH * 0.5 - whaleH / 2;
     const groundY = whaleTop + 15;
     // 고래 등 위 가로 분포 — 가운데가 약간 높은 곡선
-    for(let i = 0; i < 5; i++){
+    for(let i = 0; i < 7; i++){
       const b = spawnBottle(w);
       // 가로 위치 고르게 분포 (약간 랜덤)
-      const frac = (i + 0.5) / 5;
+      const frac = (i + 0.5) / 7;
       b.x = frac * w + (Math.random() - 0.5) * 40;
       const centerDist = Math.abs(b.x - w/2) / (w/2);
       const curvedGround = groundY + centerDist * centerDist * 40;
