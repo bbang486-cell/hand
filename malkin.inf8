@@ -1,0 +1,928 @@
+/*
+ * MALKIN — gothic cat synth voice (MUHAN module, api 1)
+ *
+ * Ten oscillators (sine, tri, saw, square, supersaw, FM, wavefolder, hard sync,
+ * wavetable morph, formant "vox") → drive → 4-pole ladder filter → ADSR VCA →
+ * ping-pong tape delay, played by a built-in arpeggiator.
+ * The LCD shows a pixel-art black cat that wakes up, head-bobs and meows
+ * along with the sound.
+ *
+ * 1.0.0  first release
+ */
+
+// ───────────────────────────── DSP (AudioWorklet) ─────────────────────────────
+const PROC = `
+const TAU = 6.283185307179586;
+function ft(x) { if (x > 3) return 1; if (x < -3) return -1; const q = x * x; return x * (27 + q) / (27 + 9 * q); }
+function blep(t, dt) {
+  if (t < dt) { t /= dt; return t + t - t * t - 1; }
+  if (t > 1 - dt) { t = (t - 1) / dt; return t * t + t + t + 1; }
+  return 0;
+}
+const CHORDS = [[0,3,7],[0,4,7],[0,5,7],[0,3,6],[0,3,7,10],[0,4,7,11],[0,3,7,11],[0,1,5,7],[0]];
+const FMR = [0.5,1,1.5,2,2.5,3,3.5,4,5,7];
+const VOW = [[730,1090],[530,1840],[270,2290],[570,840],[300,870]];
+const SUP = [-1,-0.62,-0.28,0,0.28,0.62,1];
+const SUPG = [0.55,0.7,0.85,1,0.85,0.7,0.55];
+const LV = ['lvSine','lvTri','lvSaw','lvSqr','lvSuper','lvFm','lvFold','lvSync','lvMorph','lvVox'];
+
+class MalkinProc extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    const sr = sampleRate;
+    this.sr = sr;
+    this.p = {
+      lvSine:0, lvTri:0, lvSaw:0.55, lvSqr:0.25, lvSuper:0.4, lvFm:0, lvFold:0, lvSync:0, lvMorph:0, lvVox:0,
+      drift:0.2, skew:0.5, sawOct:0, pw:0.5, spread:0.35, index:0.3, fold:0.3, sync:0.3, morph:0.35, vowel:0,
+      cutoff:700, res:0.45, envAmt:0.5, fmode:0, drive:0.25,
+      atk:0.1, dec:0.45, sus:0.35, rel:0.4,
+      pitch:0, glide:0.05, fmRatio:3, level:0.7,
+      dTime:0.41, dFdbk:0.45, dTone:0.5, dMix:0.3,
+      rate:110, gateLen:0.5, range:2, arp:1, mode:0, chord:0,
+    };
+    this.conn = { voct:false, gate:false, clock:false };
+    this.ph = new Float64Array(24);
+    this.dr = new Float32Array(10);
+    this.dm = new Float32Array(10).fill(1);
+    this.sm = new Float32Array(7).fill(1);
+    for (let i = 0; i < 24; i++) this.ph[i] = Math.random();
+    // pitch / arp
+    this.semi = 0; this.semiT = 0;
+    this.stepPos = 1e9; this.idx = -1; this.dir = 1; this.steps = 0;
+    this.gateTimer = 0; this.envGate = false; this.prevGate = false;
+    this.gHigh = false; this.cHigh = false;
+    this.lastClk = -1e9; this.clkInt = sr * 0.136; this.t = 0;
+    // env
+    this.env = 0; this.stage = 0;
+    // filter
+    this.y1 = 0; this.y2 = 0; this.y3 = 0; this.y4 = 0;
+    this.cutS = 700;
+    // delay
+    const dl = Math.ceil(sr * 2) + 4;
+    this.bL = new Float32Array(dl); this.bR = new Float32Array(dl); this.dl = dl; this.w = 0;
+    this.dT = 0.41 * sr; this.lpL = 0; this.lpR = 0;
+    // dc
+    this.dx = 0; this.dy = 0;
+    // meter
+    this.acc = 0; this.cnt = 0;
+    this.port.onmessage = (e) => {
+      const d = e.data;
+      if (d === '__rack_dispose') { this.dead = true; return; }
+      if (d && d.t === 'p') this.p[d.id] = d.v;
+      else if (d && d.t === 'c') this.conn[d.id] = d.v;
+    };
+  }
+
+  notes() {
+    const p = this.p;
+    const ch = CHORDS[Math.max(0, Math.min(CHORDS.length - 1, Math.round(p.chord)))];
+    const r = Math.max(1, Math.min(4, Math.round(p.range)));
+    const out = [];
+    for (let o = 0; o < r; o++) for (let k = 0; k < ch.length; k++) out.push(ch[k] + 12 * o);
+    return out;
+  }
+
+  step(len) {
+    const p = this.p, ns = this.notes(), n = ns.length, m = Math.round(p.mode);
+    if (m === 0) this.idx = (this.idx + 1) % n;
+    else if (m === 1) this.idx = this.idx <= 0 ? n - 1 : this.idx - 1;
+    else if (m === 2) {
+      if (n === 1) this.idx = 0;
+      else {
+        let i = this.idx + this.dir;
+        if (i >= n) { this.dir = -1; i = n - 2; } else if (i < 0) { this.dir = 1; i = 1; }
+        this.idx = i;
+      }
+    } else if (m === 3) this.idx = Math.floor(Math.random() * n);
+    else {
+      let i = this.idx < 0 ? 0 : this.idx + (Math.random() < 0.5 ? -1 : 1);
+      if (i < 0) i = 1; if (i >= n) i = n - 2;
+      this.idx = Math.max(0, Math.min(n - 1, i));
+    }
+    if (this.idx >= n || this.idx < 0) this.idx = 0;
+    this.semiT = ns[this.idx];
+    this.gateTimer = Math.max(32, len * Math.max(0.05, Math.min(1, p.gateLen)));
+    this.envGate = true;
+    if (this.prevGate && p.gateLen < 0.98) this.prevGate = false; // retrigger
+    this.steps++;
+  }
+
+  process(inputs, outputs) {
+    if (this.dead) return false;
+    const oL = outputs[0][0], oR = outputs[1][0], oE = outputs[2][0];
+    if (!oL) return true;
+    const n = oL.length, sr = this.sr, p = this.p, c = this.conn;
+    const iv = inputs[0] && inputs[0][0], ig = inputs[1] && inputs[1][0], ic = inputs[2] && inputs[2][0];
+    const icut = inputs[3] && inputs[3][0], itim = inputs[4] && inputs[4][0];
+    const voct = iv && iv.length ? iv[0] : 0;
+    const timb = itim && itim.length ? itim[0] : 0;
+
+    // block-rate values
+    const L = new Float32Array(10);
+    for (let i = 0; i < 10; i++) L[i] = Math.max(0, p[LV[i]] || 0);
+    const drift = p.drift;
+    for (let i = 0; i < 10; i++) {
+      this.dr[i] = this.dr[i] * 0.997 + (Math.random() - 0.5) * 0.06;
+      this.dm[i] = Math.pow(2, (this.dr[i] * drift * 22) / 1200);
+    }
+    const spr = p.spread;
+    for (let j = 0; j < 7; j++) this.sm[j] = Math.pow(2, (SUP[j] * spr * 0.7) / 12);
+    const cl = (v) => v < 0 ? 0 : v > 1 ? 1 : v;
+    const fmI = cl(p.index + timb * 0.5) * 7;
+    const foldA = 1 + cl(p.fold + timb * 0.5) * 7;
+    const morph = cl(p.morph + timb * 0.5) * 2.999;
+    const vow = cl(p.vowel + timb * 0.5) * 3.999;
+    const vi = Math.floor(vow), vf = vow - vi;
+    const F1 = VOW[vi][0] + (VOW[vi + 1][0] - VOW[vi][0]) * vf;
+    const F2 = VOW[vi][1] + (VOW[vi + 1][1] - VOW[vi][1]) * vf;
+    const skew = 0.03 + cl(p.skew) * 0.94;
+    const pw = 0.05 + cl(p.pw) * 0.9;
+    const syncR = 1 + cl(p.sync + timb * 0.3) * 7;
+    const fmR = FMR[Math.max(0, Math.min(9, Math.round(p.fmRatio)))];
+    const sawMul = Math.pow(2, Math.round(p.sawOct));
+    const gl = p.glide <= 0.001 ? 1 : 1 - Math.exp(-1 / (sr * 0.6 * p.glide * p.glide + 1));
+    const aT = 0.001 * Math.pow(4000, cl(p.atk));
+    const dC = Math.exp(-4.6 / (sr * 0.005 * Math.pow(600, cl(p.dec))));
+    const rC = Math.exp(-4.6 / (sr * 0.005 * Math.pow(1000, cl(p.rel))));
+    const aInc = 1 / (aT * sr);
+    const sus = cl(p.sus);
+    const k = cl(p.res) * 4.1;
+    const fm = Math.round(p.fmode);
+    const dg = 1 + p.drive * 14, dnorm = 0.5 / ft(0.5 * dg);
+    const stepLen = sr * 60 / Math.max(20, p.rate) / 4;
+    const arpOn = p.arp >= 0.5;
+    const dTarget = Math.max(0.01, Math.min(1.9, p.dTime)) * sr;
+    const fb = Math.min(0.97, Math.max(0, p.dFdbk));
+    const toneF = 600 * Math.pow(20, cl(p.dTone));
+    const tc = 1 - Math.exp(-TAU * toneF / sr);
+    const mix = cl(p.dMix);
+    const lvl = p.level;
+    const cv = icut && icut.length ? icut : null;
+    const base = 130.8128 * Math.pow(2, voct);
+
+    for (let i = 0; i < n; i++) {
+      this.t++;
+      // ── gate / clock edges (hysteresis 0.5 / 0.3)
+      let gRise = false, cRise = false;
+      if (ig && ig.length) {
+        const g = ig[i];
+        if (!this.gHigh && g > 0.5) { this.gHigh = true; gRise = true; }
+        else if (this.gHigh && g < 0.3) this.gHigh = false;
+      }
+      if (ic && ic.length) {
+        const g = ic[i];
+        if (!this.cHigh && g > 0.5) { this.cHigh = true; cRise = true; }
+        else if (this.cHigh && g < 0.3) this.cHigh = false;
+      }
+      const gateC = c.gate;
+      if (cRise) {
+        const iv2 = this.t - this.lastClk;
+        if (iv2 < sr * 2) this.clkInt = iv2;
+        this.lastClk = this.t;
+      }
+      const ext = c.clock && (this.t - this.lastClk) < sr * 2;
+      this.ext = ext;
+
+      // ── arp / gate logic
+      if (arpOn) {
+        const run = !gateC || this.gHigh;
+        if (run) {
+          if (gRise) { this.idx = -1; this.dir = 1; this.stepPos = 0; this.step(ext ? this.clkInt : stepLen); }
+          else if (ext) { if (cRise) this.step(this.clkInt); }
+          else {
+            this.stepPos++;
+            if (this.stepPos >= stepLen) { this.stepPos = 0; this.step(stepLen); }
+          }
+          if (this.gateTimer > 0) { this.gateTimer--; if (this.gateTimer <= 0 && p.gateLen < 0.98) this.envGate = false; }
+        } else { this.envGate = false; this.stepPos = 1e9; }
+      } else {
+        this.semiT = 0;
+        if (gRise) { this.steps++; this.prevGate = false; }
+        this.envGate = gateC ? this.gHigh : true;
+      }
+
+      // ── envelope
+      if (this.envGate && !this.prevGate) this.stage = 1;
+      else if (!this.envGate && this.prevGate) this.stage = 4;
+      this.prevGate = this.envGate;
+      let e = this.env;
+      if (this.stage === 1) { e += aInc; if (e >= 1) { e = 1; this.stage = 2; } }
+      else if (this.stage === 2) { e = sus + (e - sus) * dC; }
+      else if (this.stage === 4) { e *= rC; if (e < 1e-5) { e = 0; this.stage = 0; } }
+      this.env = e;
+
+      // ── pitch
+      this.semi += (this.semiT + p.pitch - this.semi) * gl;
+      const f = Math.min(sr * 0.45, base * Math.pow(2, this.semi / 12));
+      const dt = f / sr;
+      const ph = this.ph, dm = this.dm;
+      let s = 0, x, q, t2;
+
+      // I  SINE
+      if (L[0] > 0.001) { x = ph[0] + dt * dm[0]; if (x >= 1) x -= 1; ph[0] = x; s += L[0] * Math.sin(TAU * x); }
+      // II TRI (skewable → saw)
+      if (L[1] > 0.001) {
+        x = ph[1] + dt * dm[1]; if (x >= 1) x -= 1; ph[1] = x;
+        q = x < skew ? (2 * x / skew - 1) : (1 - 2 * (x - skew) / (1 - skew));
+        s += L[1] * q;
+      }
+      // III SAW (+ octave)
+      if (L[2] > 0.001) {
+        const d = Math.min(0.45, dt * dm[2] * sawMul);
+        x = ph[2] + d; if (x >= 1) x -= 1; ph[2] = x;
+        s += L[2] * (2 * x - 1 - blep(x, d));
+      }
+      // IV SQUARE (pulse width)
+      if (L[3] > 0.001) {
+        const d = dt * dm[3];
+        x = ph[3] + d; if (x >= 1) x -= 1; ph[3] = x;
+        t2 = x + 1 - pw; if (t2 >= 1) t2 -= 1;
+        q = (x < pw ? 1 : -1) + blep(x, d) - blep(t2, d);
+        s += L[3] * q * 0.8;
+      }
+      // V  SUPER (7 detuned saws)
+      if (L[4] > 0.001) {
+        let a = 0;
+        for (let j = 0; j < 7; j++) {
+          const d = Math.min(0.45, dt * dm[4] * this.sm[j]);
+          x = ph[10 + j] + d; if (x >= 1) x -= 1; ph[10 + j] = x;
+          a += SUPG[j] * (2 * x - 1 - blep(x, d));
+        }
+        s += L[4] * a * 0.3;
+      }
+      // VI FM (2-op)
+      if (L[5] > 0.001) {
+        x = ph[5] + dt * dm[5]; if (x >= 1) x -= 1; ph[5] = x;
+        q = ph[17] + dt * dm[5] * fmR; if (q >= 1) q -= Math.floor(q); ph[17] = q;
+        s += L[5] * Math.sin(TAU * x + fmI * Math.sin(TAU * q));
+      }
+      // VII FOLD (sine through a wavefolder)
+      if (L[6] > 0.001) {
+        x = ph[6] + dt * dm[6]; if (x >= 1) x -= 1; ph[6] = x;
+        q = Math.sin(TAU * x) * foldA;
+        q = (q + 1) * 0.25; q = 4 * Math.abs(q - Math.floor(q + 0.5)) - 1;
+        s += L[6] * Math.sin(1.5707963 * q);
+      }
+      // VIII SYNC (hard-synced saw)
+      if (L[7] > 0.001) {
+        const d = dt * dm[7];
+        x = ph[7] + d;
+        let sl = ph[18] + d * syncR;
+        if (x >= 1) { x -= 1; sl = x * syncR; }
+        if (sl >= 1) sl -= Math.floor(sl);
+        ph[7] = x; ph[18] = sl;
+        s += L[7] * (2 * sl - 1 - blep(sl, Math.min(0.45, d * syncR))) * 0.85;
+      }
+      // IX MORPH (sine → tri → saw → square)
+      if (L[8] > 0.001) {
+        const d = dt * dm[8];
+        x = ph[8] + d; if (x >= 1) x -= 1; ph[8] = x;
+        const seg = Math.floor(morph), fr = morph - seg;
+        let w0, w1;
+        const sn = Math.sin(TAU * x), tr = 1 - 4 * Math.abs(x - 0.5);
+        const sw = 2 * x - 1 - blep(x, d);
+        if (seg === 0) { w0 = sn; w1 = tr; }
+        else if (seg === 1) { w0 = tr; w1 = sw; }
+        else {
+          w0 = sw; t2 = x + 0.5; if (t2 >= 1) t2 -= 1;
+          w1 = (x < 0.5 ? 1 : -1) + blep(x, d) - blep(t2, d);
+        }
+        s += L[8] * (w0 + (w1 - w0) * fr) * 0.9;
+      }
+      // X  VOX (formant)
+      if (L[9] > 0.001) {
+        x = ph[9] + dt * dm[9]; if (x >= 1) x -= 1; ph[9] = x;
+        const w = 0.5 + 0.5 * Math.cos(3.14159265 * x);
+        s += L[9] * (Math.sin(TAU * (F1 / f) * x) + 0.55 * Math.sin(TAU * (F2 / f) * x)) * w * w * 1.1;
+      }
+
+      // ── drive
+      let v = ft(s * 0.32 * dg) * dnorm;
+
+      // ── ladder filter (2x oversampled)
+      let cu = p.cutoff * Math.pow(2, p.envAmt * e * 7 + (cv ? cv[i] * 5 : 0) + (this.semi / 12 + voct) * 0.5);
+      if (cu > sr * 0.42) cu = sr * 0.42; if (cu < 15) cu = 15;
+      const wc = 3.14159265 * cu / sr;
+      const g = wc / (1 + wc);
+      let y1 = this.y1, y2 = this.y2, y3 = this.y3, y4 = this.y4, inp = 0;
+      for (let o = 0; o < 2; o++) {
+        inp = ft(v * (1 + k * 0.45) - k * y4);
+        y1 += g * (inp - ft(y1));
+        y2 += g * (ft(y1) - ft(y2));
+        y3 += g * (ft(y2) - ft(y3));
+        y4 += g * (ft(y3) - y4);
+      }
+      this.y1 = y1; this.y2 = y2; this.y3 = y3; this.y4 = y4;
+      let y;
+      if (fm === 0) y = y4;
+      else if (fm === 1) y = (y2 - 2 * y3 + y4) * 2.4;
+      else y = (inp - 4 * y1 + 6 * y2 - 4 * y3 + y4) * 0.9;
+
+      // ── VCA
+      y *= e * lvl * 2.2;
+
+      // ── DC block
+      const dy = y - this.dx + 0.995 * this.dy; this.dx = y; this.dy = dy; y = dy;
+
+      // ── ping-pong tape delay
+      this.dT += (dTarget - this.dT) * 0.00025;
+      let rp = this.w - this.dT; if (rp < 0) rp += this.dl;
+      const ri = Math.floor(rp), rf = rp - ri, ri2 = ri + 1 >= this.dl ? 0 : ri + 1;
+      const dL = this.bL[ri] + (this.bL[ri2] - this.bL[ri]) * rf;
+      const dR = this.bR[ri] + (this.bR[ri2] - this.bR[ri]) * rf;
+      this.lpL += (dL - this.lpL) * tc; this.lpR += (dR - this.lpR) * tc;
+      this.bL[this.w] = ft(y + this.lpR * fb);
+      this.bR[this.w] = ft(this.lpL * fb);
+      this.w++; if (this.w >= this.dl) this.w = 0;
+      const dry = y * (1 - 0.35 * mix);
+      const outL = ft((dry + dL * mix) * 0.95), outR = ft((dry + dR * mix) * 0.95);
+      oL[i] = outL; oR[i] = outR; oE[i] = e;
+      this.acc += outL * outL + outR * outR;
+    }
+
+    this.cnt += n;
+    if (this.cnt >= 1024) {
+      this.port.postMessage({ t: 'v', l: Math.sqrt(this.acc / (this.cnt * 2)), e: this.env, n: Math.round(48 + this.semi + voct * 12), s: this.steps, x: this.ext ? 1 : 0 });
+      this.acc = 0; this.cnt = 0;
+    }
+    return true;
+  }
+}
+registerProcessor('NAME', MalkinProc);
+`;
+let _h = 0; for (const ch of PROC) _h = (_h * 31 + ch.charCodeAt(0)) | 0;
+const PROC_NAME = `malkin-voice-${(_h >>> 0).toString(36)}`;
+const PROC_CODE = PROC.replace("'NAME'", `'${PROC_NAME}'`);
+
+// ───────────────────────────── helpers ─────────────────────────────
+const NOTE = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+const noteName = (m) => NOTE[((m % 12) + 12) % 12] + (Math.floor(m / 12) - 1);
+const pct = (v) => Math.round(v * 100) + '%';
+const sec = (t) => (t < 1 ? Math.round(t * 1000) + ' ms' : t.toFixed(2) + ' s');
+const CHORD_N = ['MIN', 'MAJ', 'SUS4', 'DIM', 'MIN7', 'MAJ7', 'HARM', 'PHRYG', 'OCT'];
+const MODE_N = ['UP', 'DOWN', 'UP-DN', 'RAND', 'PROWL'];
+const FMR_N = ['1:0.5', '1:1', '1:1.5', '1:2', '1:2.5', '1:3', '1:3.5', '1:4', '1:5', '1:7'];
+
+// ───────────────────────────── skin art ─────────────────────────────
+function scallop(cx, cy, r1, r2, lobes) {
+  let d = '';
+  for (let i = 0; i <= lobes * 8; i++) {
+    const a = (i / (lobes * 8)) * Math.PI * 2;
+    const r = r2 + (r1 - r2) * Math.abs(Math.cos((a * lobes) / 2));
+    d += (i ? 'L' : 'M') + (cx + Math.sin(a) * r).toFixed(2) + ' ' + (cy - Math.cos(a) * r).toFixed(2);
+  }
+  return d + 'Z';
+}
+function knobSvg(id, pointerW, ring) {
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">` +
+    `<defs><radialGradient id="${id}" cx="36%" cy="30%" r="72%">` +
+    `<stop offset="0" stop-color="#6a4560"/><stop offset=".45" stop-color="#26131f"/><stop offset="1" stop-color="#070308"/></radialGradient></defs>` +
+    `<path d="${scallop(50, 50, 49, 43, 12)}" fill="#0b050a"/>` +
+    `<circle cx="50" cy="50" r="38" fill="url(#${id})"/>` +
+    (ring ? `<circle cx="50" cy="50" r="30" fill="none" stroke="#ff8fc0" stroke-opacity=".35" stroke-width="1.6"/>` : '') +
+    `<rect x="${50 - pointerW / 2}" y="5" width="${pointerW}" height="38" rx="${pointerW / 2}" fill="#ff7eb6"/>` +
+    `<circle cx="50" cy="8.5" r="${pointerW * 0.42}" fill="#ffe3f0"/>` +
+    `</svg>`;
+}
+
+// panel layout constants (px, panel is 600 × 380)
+const OSC_X = [249, 284, 319, 354, 389, 424, 459, 494, 529, 564];
+const ROMAN = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X'];
+
+function banner(cx, cy, text, w) {
+  const hw = w / 2;
+  return `<path d="M${cx - hw - 7} ${cy} L${cx - hw} ${cy - 7} H${cx + hw} L${cx + hw + 7} ${cy} L${cx + hw} ${cy + 7} H${cx - hw} Z" fill="#160810"/>` +
+    `<text x="${cx}" y="${cy + 4}" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-style="italic" letter-spacing="2.2" fill="#ffc2dc">${text}</text>`;
+}
+function frame(x, y, w, h) {
+  // thin double rule with pointed-arch corners
+  return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="7" fill="#000" fill-opacity=".035" stroke="#1d0a15" stroke-width="1.4"/>` +
+    `<rect x="${x + 3}" y="${y + 3}" width="${w - 6}" height="${h - 6}" rx="5" fill="none" stroke="#1d0a15" stroke-opacity=".35" stroke-width=".8"/>` +
+    [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].map(([a, b]) =>
+      `<path d="M${a} ${b - 4} L${a + 3.2} ${b} L${a} ${b + 4} L${a - 3.2} ${b} Z" fill="#1d0a15"/>`).join('');
+}
+function bat(x, y, s) {
+  return `<path transform="translate(${x} ${y}) scale(${s})" d="M0 0 C-3 -3 -7 -3 -10 -1 C-8 -1 -7 1 -7 2 C-6 1 -4 1 -3 2 C-3 1 -1 1 0 2 C1 1 3 1 3 2 C4 1 6 1 7 2 C7 1 8 -1 10 -1 C7 -3 3 -3 0 0 Z M-1.2 -0.6 L-1.6 -2.2 L-0.4 -1 Z M1.2 -0.6 L1.6 -2.2 L0.4 -1 Z" fill="#1a0912"/>`;
+}
+
+function panelSvg() {
+  const quatre = `<g fill="none" stroke="#b9467e" stroke-width=".9">` +
+    `<circle cx="20" cy="14" r="5"/><circle cx="20" cy="26" r="5"/><circle cx="14" cy="20" r="5"/><circle cx="26" cy="20" r="5"/>` +
+    `<path d="M0 0 L4 4 M40 0 L36 4 M0 40 L4 36 M40 40 L36 36"/></g><circle cx="20" cy="20" r="1.6" fill="#b9467e"/>`;
+  let s = `<svg xmlns="http://www.w3.org/2000/svg" width="600" height="380" viewBox="0 0 600 380">` +
+    `<defs>` +
+    `<linearGradient id="mkBg" x1="0" y1="0" x2=".35" y2="1"><stop offset="0" stop-color="#f9c0d8"/><stop offset=".55" stop-color="#f2a3c6"/><stop offset="1" stop-color="#e68ab3"/></linearGradient>` +
+    `<radialGradient id="mkVig" cx="35%" cy="25%" r="85%"><stop offset=".55" stop-color="#5a0c34" stop-opacity="0"/><stop offset="1" stop-color="#5a0c34" stop-opacity=".28"/></radialGradient>` +
+    `<pattern id="mkDam" width="40" height="40" patternUnits="userSpaceOnUse">${quatre}</pattern>` +
+    `<linearGradient id="mkOut" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff1f7"/><stop offset="1" stop-color="#fbd9e8"/></linearGradient>` +
+    `<radialGradient id="mkMoon" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#fff" stop-opacity=".55"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></radialGradient>` +
+    `</defs>` +
+    `<rect width="600" height="380" fill="url(#mkBg)"/>` +
+    `<rect width="600" height="380" fill="url(#mkDam)" opacity=".22"/>` +
+    `<rect width="600" height="380" fill="url(#mkVig)"/>` +
+    // lace rules near top and bottom
+    `<path d="M0 33.5 H600 M0 371.5 H600" stroke="#1d0a15" stroke-width="1.2"/>`;
+  for (let x = 6; x < 600; x += 12) {
+    s += `<path d="M${x - 6} 33.5 A6 6 0 0 0 ${x + 6} 33.5" fill="none" stroke="#1d0a15" stroke-width=".9" opacity=".55"/>`;
+    s += `<circle cx="${x}" cy="37" r=".9" fill="#1d0a15" opacity=".55"/>`;
+    s += `<path d="M${x - 6} 371.5 A6 6 0 0 1 ${x + 6} 371.5" fill="none" stroke="#1d0a15" stroke-width=".9" opacity=".55"/>`;
+  }
+  // display surround: dark gothic frame with finials
+  s += `<rect x="9" y="40" width="210" height="122" rx="5" fill="#160810"/>` +
+    `<rect x="11.5" y="42.5" width="205" height="117" rx="3.5" fill="none" stroke="#ff8fc0" stroke-opacity=".55" stroke-width="1"/>`;
+  for (const fx of [9, 219]) {
+    s += `<path d="M${fx - 5} 44 L${fx} 30 L${fx + 5} 44 Z" fill="#160810"/><circle cx="${fx}" cy="29" r="2.2" fill="#160810"/>`;
+  }
+  // oscillator bank frame + roman numerals + column guides
+  s += frame(226, 42, 362, 118);
+  OSC_X.forEach((x, i) => {
+    s += `<text x="${x}" y="60" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="11" font-weight="bold" fill="#2a0c1d">${ROMAN[i]}</text>`;
+    s += `<path d="M${x} 104 V112" stroke="#2a0c1d" stroke-opacity=".45" stroke-width="1" stroke-dasharray="1.5 2"/>`;
+  });
+  // middle band frames
+  s += frame(10, 174, 126, 128) + banner(73, 174, 'FILTER', 46);
+  s += frame(142, 174, 104, 128) + banner(194, 174, 'ADSR', 32);
+  s += frame(252, 174, 92, 128) + banner(298, 174, 'VOICE', 38);
+  s += frame(350, 174, 92, 128) + banner(396, 174, 'DELAY', 38);
+  s += frame(448, 174, 142, 128) + banner(519, 174, 'ARPEGGIO', 66);
+  // jack band: inputs (pink) and outputs (pale box)
+  s += frame(12, 310, 232, 54);
+  s += `<rect x="438" y="310" width="152" height="54" rx="7" fill="url(#mkOut)" stroke="#1d0a15" stroke-width="2"/>` +
+    `<rect x="441.5" y="313.5" width="145" height="47" rx="5" fill="none" stroke="#1d0a15" stroke-opacity=".5" stroke-width=".8"/>`;
+  // centre ornament: lancet window with the cat
+  s += `<path d="M311 366 V336 A40 40 0 0 1 343 302 A40 40 0 0 1 375 336 V366 Z" fill="#160810"/>` +
+    `<path d="M315 366 V337 A36 36 0 0 1 343 307 A36 36 0 0 1 371 337 V366 Z" fill="#3a1030"/>` +
+    `<circle cx="358" cy="322" r="10" fill="url(#mkMoon)"/>` +
+    `<circle cx="358" cy="322" r="5" fill="#ffe4f0"/><circle cx="360.5" cy="320.5" r="4.4" fill="#3a1030"/>` +
+    `<circle cx="326" cy="320" r=".8" fill="#ffd6e8"/><circle cx="333" cy="330" r=".6" fill="#ffd6e8"/><circle cx="364" cy="340" r=".6" fill="#ffd6e8"/>` +
+    // cat silhouette
+    `<ellipse cx="341" cy="354" rx="10.5" ry="11" fill="#0b0408"/>` +
+    `<circle cx="341" cy="338" r="7.2" fill="#0b0408"/>` +
+    `<path d="M334.4 335 L335.6 326 L340 331.6 Z M347.6 335 L346.4 326 L342 331.6 Z" fill="#0b0408"/>` +
+    `<path d="M350 362 C362 364 365 350 357 346" fill="none" stroke="#0b0408" stroke-width="3" stroke-linecap="round"/>` +
+    `<ellipse cx="338.3" cy="337.6" rx="1.3" ry="1.7" fill="#ff6b9a"/><ellipse cx="343.7" cy="337.6" rx="1.3" ry="1.7" fill="#ff6b9a"/>` +
+    `<path d="M339.2 345.6 Q341 347.4 342.8 345.6" fill="none" stroke="#ff6b9a" stroke-width="1.4"/>` +
+    `<path d="M315 365.5 H371" stroke="#160810" stroke-width="2"/>` +
+    // flanking tracery + bats
+    `<path d="M262 352 Q286 336 304 352 M382 352 Q400 336 424 352" fill="none" stroke="#1d0a15" stroke-width="1.2" opacity=".7"/>` +
+    `<path d="M268 360 H304 M382 360 H418" stroke="#1d0a15" stroke-width=".9" opacity=".5"/>` +
+    bat(283, 326, 1.15) + bat(404, 322, 0.95) + bat(297, 312, 0.7);
+  s += `</svg>`;
+  return s;
+}
+
+// ───────────────────────────── pixel cat ─────────────────────────────
+// B body · E eye · K pupil · P pink (ear/nose) · M mouth · C collar · H charm · . empty
+const CAT = [
+  '...B...........B...',
+  '...BB.........BB...',
+  '..BPBB.......BBPB..',
+  '..BPPBBBBBBBBBPPB..',
+  '..BBBBBBBBBBBBBBB..',
+  '.BBBBBBBBBBBBBBBBB.',
+  '.BBEEEBBBBBBBEEEBB.',
+  '.BBEKEBBBBBBBEKEBB.',
+  '.BBEEEBBBBBBBEEEBB.',
+  '.BBBBBBBBPBBBBBBBB.',
+  '..BBBBBBMBMBBBBBB..',
+  '...BBBBBBBBBBBBB...',
+  '....CCCCCHCCCCC....',
+  '...BBBBBBBBBBBBB...',
+  '..BBBBBBBBBBBBBBB..',
+  '..BBBBBBBBBBBBBBB..',
+  '.BBBBBBBBBBBBBBBBB.',
+  '.BBBBBBBBBBBBBBBBB.',
+  '.BBBBBBBBBBBBBBBBB.',
+  '.BBBBBBBBBBBBBBBBB.',
+  '.BBBBDBBBBBBBDBBBB.',
+  '..BBBBBB...BBBBBB..',
+];
+const BAT_F = [['X...X', '.XXX.', '..X..'], ['..X..', '.XXX.', 'X...X']];
+const NOTE_S = ['.XX', '.X.', '.X.', 'XX.', 'XX.'];
+const ZED = ['XXXX', '..X.', '.X..', 'XXXX'];
+const SW = 100, SH = 56;
+
+function makeScene() {
+  const cv = document.createElement('canvas');
+  cv.width = SW; cv.height = SH;
+  const cx = cv.getContext('2d');
+  const img = cx.createImageData(SW, SH);
+  const buf = new Uint32Array(img.data.buffer);
+  const rgb = (r, g, b) => ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0;
+  const put = (x, y, c) => { x |= 0; y |= 0; if (x >= 0 && y >= 0 && x < SW && y < SH) buf[y * SW + x] = c; };
+  const blend = (x, y, r, g, b, a) => {
+    x |= 0; y |= 0; if (x < 0 || y < 0 || x >= SW || y >= SH || a <= 0) return;
+    const o = buf[y * SW + x], or = o & 255, og = (o >> 8) & 255, ob = (o >> 16) & 255;
+    if (a > 1) a = 1;
+    buf[y * SW + x] = rgb(or + (r - or) * a, og + (g - og) * a, ob + (b - ob) * a);
+  };
+  // static star field (outside the window)
+  const stars = [];
+  for (let i = 0; i < 22; i++) {
+    const x = 50 + Math.random() * 48, y = 1 + Math.random() * 30;
+    stars.push([x | 0, y | 0, Math.random() * 6.28, 0.5 + Math.random()]);
+  }
+  for (let i = 0; i < 6; i++) stars.push([1 + ((Math.random() * 14) | 0), 2 + ((Math.random() * 28) | 0), Math.random() * 6.28, 0.6 + Math.random()]);
+  return { cv, cx, img, buf, rgb, put, blend, stars };
+}
+
+const WIN_CX = 34, WIN_HW = 13, WIN_SPRING = 24, WIN_BOT = 44;
+function inWindow(x, y) {
+  const dx = x + 0.5 - WIN_CX;
+  if (y > WIN_BOT || y < 0) return false;
+  if (y >= WIN_SPRING) return Math.abs(dx) <= WIN_HW;
+  const R = WIN_HW * 2, dy = WIN_SPRING - (y + 0.5);
+  return (dx + WIN_HW) ** 2 + dy * dy <= R * R && (dx - WIN_HW) ** 2 + dy * dy <= R * R;
+}
+
+// ───────────────────────────── module ─────────────────────────────
+const P_LEVEL = [
+  ['lvSine', 'SINE', 0], ['lvTri', 'TRI', 0], ['lvSaw', 'SAW', 0.55], ['lvSqr', 'SQR', 0.25], ['lvSuper', 'SUPER', 0.4],
+  ['lvFm', 'FM', 0], ['lvFold', 'FOLD', 0], ['lvSync', 'SYNC', 0], ['lvMorph', 'MORPH', 0], ['lvVox', 'VOX', 0],
+];
+const OSC_TIP = ['Sine', 'Triangle (SKEW bends it into a saw)', 'Sawtooth', 'Square / pulse', 'Supersaw — seven detuned saws',
+  'FM — two-operator frequency modulation', 'Wavefolder — a sine folded over itself', 'Hard sync — a saw restarted by a hidden master',
+  'Wavetable morph — sine → triangle → saw → square', 'Vox — a singing formant oscillator'];
+
+export default {
+  api: 1,
+  minApp: '0.5.66',
+  id: 'malkin.voice',
+  name: 'MALKIN',
+  subtitle: 'GOTHIC SYNTH',
+  author: 'MALKIN',
+  version: '1.0.0',
+  license: 'MIT',
+  summary: 'A pink gothic mono synth: ten oscillators, ladder filter, arpeggiator, delay and a pixel cat that dances.',
+  summaries: { ko: '오실레이터 10개, 래더 필터, 아르페지에이터, 딜레이, 그리고 춤추는 픽셀 고양이가 있는 핑크 고딕 신스.' },
+  description: 'Ten oscillators — sine, triangle, saw, square, supersaw, FM, wavefolder, hard sync, wavetable morph and a singing formant voice — mixed into a drive stage and a warm 4-pole ladder filter, shaped by slider ADSR and sent through a ping-pong tape delay.\nThe built-in arpeggiator plays on its own as soon as you place it; patch GATE, CLOCK and V/OCT to play it from a sequencer or keyboard. The black cat on the LCD sleeps in silence and wakes up to bob, flick its ears and meow with the sound.',
+  descriptions: { ko: '사인·삼각·톱니·사각·슈퍼소우·FM·웨이브폴더·하드싱크·웨이브테이블 모프·포먼트(목소리) 오실레이터 10개를 섞어 드라이브와 4폴 래더 필터를 지나고, 슬라이더 ADSR 로 모양을 잡아 핑퐁 테이프 딜레이로 보냅니다.\n놓자마자 아르페지에이터가 스스로 연주합니다. GATE·CLOCK·V/OCT 를 꽂으면 시퀀서나 건반으로 연주할 수 있어요. LCD 의 검은 고양이는 조용하면 잠들고, 소리가 나면 깨어나 고개를 까딱이고 귀를 쫑긋하며 야옹거립니다.' },
+  tags: ['synth', 'voice', 'oscillator', 'fm', 'wavefolder', 'supersaw', 'ladder', 'filter', 'arpeggiator', 'delay', 'drive', 'gothic', 'cat'],
+  hp: 40,
+  color: '#ff6b9a',
+  layout: 'free',
+  display: { height: 112, x: 14, y: 46, w: 200 },
+  skin: {
+    panel: panelSvg(),
+    color: '#f2a3c6',
+    ink: '#2a0c1d',
+    flow: false,
+    knobs: {
+      big: { image: knobSvg('mkKb', 7, true), size: 46 },
+      small: { image: knobSvg('mkKs', 9, false), size: 26 },
+      mini: { image: knobSvg('mkKm', 11, false), size: 20 },
+    },
+  },
+  params: [
+    // ── oscillator levels (row 1) and their character knobs (row 2)
+    ...P_LEVEL.map(([id, label, def], i) => ({
+      id, label, size: 'mini', min: 0, max: 1, default: def, x: OSC_X[i], y: 80, tip: OSC_TIP[i] + ' — level', format: pct,
+    })),
+    { id: 'drift', label: 'DRIFT', size: 'mini', min: 0, max: 1, default: 0.2, x: OSC_X[0], y: 130, tip: 'Analog drift — all ten oscillators wander slightly out of tune', format: pct },
+    { id: 'skew', label: 'SKEW', size: 'mini', min: 0, max: 1, default: 0.5, x: OSC_X[1], y: 130, tip: 'Triangle skew (0.5 = triangle, edges = saw)', format: pct },
+    { id: 'sawOct', label: 'OCT', size: 'mini', min: -2, max: 2, step: 1, default: 0, x: OSC_X[2], y: 130, tip: 'Saw octave', format: (v) => (v > 0 ? '+' : '') + Math.round(v) + ' oct' },
+    { id: 'pw', label: 'PW', size: 'mini', min: 0, max: 1, default: 0.5, x: OSC_X[3], y: 130, tip: 'Square pulse width', format: (v) => Math.round(5 + v * 90) + '%' },
+    { id: 'spread', label: 'SPREAD', size: 'mini', min: 0, max: 1, default: 0.35, x: OSC_X[4], y: 130, tip: 'Supersaw detune spread', format: (v) => '±' + Math.round(v * 70) + ' ct' },
+    { id: 'index', label: 'INDEX', size: 'mini', min: 0, max: 1, default: 0.3, x: OSC_X[5], y: 130, tip: 'FM index (how bright and metallic)', format: (v) => (v * 7).toFixed(1) },
+    { id: 'fold', label: 'FOLDS', size: 'mini', min: 0, max: 1, default: 0.3, x: OSC_X[6], y: 130, tip: 'Wavefolder gain (more folds = more harmonics)', format: (v) => 'x' + (1 + v * 7).toFixed(1) },
+    { id: 'sync', label: 'RATIO', size: 'mini', min: 0, max: 1, default: 0.3, x: OSC_X[7], y: 130, tip: 'Sync ratio (slave pitch above the master)', format: (v) => 'x' + (1 + v * 7).toFixed(2) },
+    { id: 'morph', label: 'TABLE', size: 'mini', min: 0, max: 1, default: 0.35, x: OSC_X[8], y: 130, tip: 'Wavetable position: sine → tri → saw → square', format: (v) => ['SIN', 'TRI', 'SAW', 'SQR'][Math.min(3, Math.round(v * 3))] + ' ' + pct(v) },
+    { id: 'vowel', label: 'VOWEL', size: 'mini', min: 0, max: 1, default: 0, x: OSC_X[9], y: 130, tip: 'Formant vowel A → E → I → O → U', format: (v) => ['A', 'E', 'I', 'O', 'U'][Math.min(4, Math.round(v * 4))] },
+
+    // ── filter + drive
+    { id: 'cutoff', label: 'CUTOFF', big: true, min: 30, max: 14000, curve: 'exp', default: 700, x: 42, y: 212, format: (v) => (v >= 1000 ? (v / 1000).toFixed(2) + ' kHz' : Math.round(v) + ' Hz') },
+    { id: 'drive', label: 'DRIVE', big: true, min: 0, max: 1, default: 0.25, x: 42, y: 268, tip: 'Drive — saturates the oscillators before the filter', format: pct },
+    { id: 'res', label: 'RES', min: 0, max: 1, default: 0.45, x: 104, y: 204, tip: 'Resonance (a whistle at the cutoff; self-oscillates near max)', format: pct },
+    { id: 'envAmt', label: 'ENV', min: -1, max: 1, default: 0.5, x: 104, y: 246, tip: 'How far the ADSR opens (or closes) the filter', format: (v) => (v > 0 ? '+' : '') + Math.round(v * 100) + '%' },
+    { id: 'fmode', label: 'MODE', type: 'switch', options: ['LP', 'BP', 'HP'], default: 0, x: 104, y: 284, tip: 'Filter mode',
+      icons: ['M1 3H9C12 3 13 5 17 9', 'M1 9C5 9 7 2 9 2C11 2 13 9 17 9', 'M1 9C5 5 6 3 9 3H17'] },
+
+    // ── ADSR sliders
+    { id: 'atk', label: 'A', type: 'slider', length: 60, min: 0, max: 1, default: 0.1, x: 160, y: 236, tip: 'Attack', format: (v) => sec(0.001 * Math.pow(4000, v)) },
+    { id: 'dec', label: 'D', type: 'slider', length: 60, min: 0, max: 1, default: 0.45, x: 184, y: 236, tip: 'Decay', format: (v) => sec(0.005 * Math.pow(600, v)) },
+    { id: 'sus', label: 'S', type: 'slider', length: 60, min: 0, max: 1, default: 0.35, x: 208, y: 236, tip: 'Sustain level', format: pct },
+    { id: 'rel', label: 'R', type: 'slider', length: 60, min: 0, max: 1, default: 0.4, x: 232, y: 236, tip: 'Release', format: (v) => sec(0.005 * Math.pow(1000, v)) },
+
+    // ── voice
+    { id: 'pitch', label: 'PITCH', min: -24, max: 24, step: 1, default: 0, x: 276, y: 208, tip: 'Root note', format: (v) => noteName(48 + Math.round(v)) },
+    { id: 'glide', label: 'GLIDE', min: 0, max: 1, default: 0.05, x: 324, y: 208, tip: 'Portamento between notes', format: (v) => (v < 0.01 ? 'OFF' : sec(0.6 * v * v)) },
+    { id: 'fmRatio', label: 'FM RAT', min: 0, max: 9, step: 1, default: 3, x: 276, y: 264, tip: 'FM carrier : modulator ratio', format: (v) => FMR_N[Math.round(v)] },
+    { id: 'level', label: 'LEVEL', min: 0, max: 1, default: 0.7, x: 324, y: 264, tip: 'Output level', format: pct },
+
+    // ── delay
+    { id: 'dTime', label: 'TIME', min: 0.02, max: 1.5, curve: 'exp', default: 0.41, x: 372, y: 208, tip: 'Delay time (turn it while playing for tape warble)', format: sec },
+    { id: 'dFdbk', label: 'FDBK', min: 0, max: 0.95, default: 0.45, x: 420, y: 208, tip: 'Delay feedback (echo repeats)', format: pct },
+    { id: 'dTone', label: 'TONE', min: 0, max: 1, default: 0.5, x: 372, y: 264, tip: 'Echo brightness', format: pct },
+    { id: 'dMix', label: 'MIX', min: 0, max: 1, default: 0.3, x: 420, y: 264, tip: 'Delay dry/wet', format: pct },
+
+    // ── arpeggiator
+    { id: 'rate', label: 'RATE', min: 40, max: 240, step: 1, default: 110, x: 468, y: 208, tip: 'Arp tempo (steps are 1/16 notes)', format: (v) => Math.round(v) + ' BPM' },
+    { id: 'gateLen', label: 'GATE', min: 0.05, max: 1, default: 0.5, x: 516, y: 208, tip: 'Note length (100% = legato)', format: pct },
+    { id: 'range', label: 'OCTS', min: 1, max: 4, step: 1, default: 2, x: 564, y: 208, tip: 'Octave range', format: (v) => Math.round(v) + ' oct' },
+    { id: 'arp', label: 'ARP', type: 'button', options: ['OFF', 'ON'], light: 1, color: '#ff6b9a', default: 1, x: 468, y: 264, tip: 'Arpeggiator on/off (off: GATE plays the root, or a drone if unpatched)' },
+    { id: 'mode', label: 'ORDER', min: 0, max: 4, step: 1, default: 0, x: 516, y: 264, tip: 'Arp order', format: (v) => MODE_N[Math.round(v)] },
+    { id: 'chord', label: 'CHORD', min: 0, max: 8, step: 1, default: 0, x: 564, y: 264, tip: 'Arp chord', format: (v) => CHORD_N[Math.round(v)] },
+  ],
+  inputs: [
+    { id: 'voct', label: 'V/OCT', x: 34, y: 342, description: 'Pitch, 1 V per octave (0 = C3). Patch a sequencer or KEYS pitch here to transpose the arp' },
+    { id: 'gate', label: 'GATE', x: 80, y: 342, description: 'Gate. With ARP on, the arp runs while the gate is high; with ARP off, it plays the envelope. Unpatched = runs freely' },
+    { id: 'clock', label: 'CLOCK', x: 126, y: 342, description: 'One pulse = one arp step (1/16 note). Patch CLOCK here to lock to the rack; falls back to RATE after 2 s' },
+    { id: 'cutoff', label: 'CUTOFF', x: 172, y: 342, description: 'Filter cutoff CV (±1 = ±5 octaves). Try an LFO' },
+    { id: 'timbre', label: 'TIMBRE', x: 218, y: 342, description: 'Timbre CV — moves FM index, folds, sync, wavetable and vowel together. Try an LFO or envelope' },
+  ],
+  outputs: [
+    { id: 'env', label: 'ENV', x: 462, y: 342, description: 'The ADSR envelope (0 – 1). Patch to another filter or VCA' },
+    { id: 'outL', label: 'OUT L', x: 512, y: 342, description: 'Left audio (mono if used alone). Patch to LINE OUT L' },
+    { id: 'outR', label: 'OUT R', x: 562, y: 342, description: 'Right audio — the delay ping-pongs between L and R. Patch to LINE OUT R' },
+  ],
+
+  async create(api) {
+    const { audio, worklet, output } = api;
+    await worklet(PROC_CODE);
+    const node = new AudioWorkletNode(audio, PROC_NAME, {
+      numberOfInputs: 5, numberOfOutputs: 3, outputChannelCount: [1, 1, 1],
+      channelCount: 1, channelCountMode: 'explicit', channelInterpretation: 'discrete',
+    });
+    const ins = {};
+    ['voct', 'gate', 'clock', 'cutoff', 'timbre'].forEach((id, i) => {
+      const g = audio.createGain();
+      g.channelCount = 1; g.channelCountMode = 'explicit';
+      g.connect(node, 0, i);
+      ins[id] = g;
+    });
+    const outL = audio.createGain(), outR = audio.createGain(), env = audio.createGain();
+    node.connect(outL, 0); node.connect(outR, 1); node.connect(env, 2);
+    const keep = audio.createGain(); keep.gain.value = 0;
+    node.connect(keep, 0); keep.connect(output);
+
+    // ── visual state for the cat
+    const P = {};
+    const V = {
+      raw: 0, lvl: 0, env: 0, note: 48, step: 0, ext: 0, got: false,
+      quiet: 0, sleep: true, last: performance.now(),
+      tilt: 0, bob: 0, earL: 0, earR: 0, mouth: 0, blink: 0, nextBlink: 2,
+      bats: [], notes: [], zs: [], zT: 0, tail: 0, startle: 0,
+    };
+    const onStep = () => {
+      const L = V.lvl;
+      if (L < 0.02) return;
+      V.tilt = L > 0.18 ? (V.tilt <= 0 ? 1 : -1) : 0;
+      V.bob = Math.min(3, 0.8 + L * 3);
+      if (Math.random() < 0.3) { if (Math.random() < 0.5) V.earL = 0.18; else V.earR = 0.18; }
+      if (L > 0.3 && Math.random() < 0.22) {
+        V.mouth = 0.28;
+        V.notes.push({ x: 44, y: 30, vx: 3 + Math.random() * 4, vy: -9 - Math.random() * 5, life: 1.6 });
+      }
+      if (L > 0.38 && Math.random() < 0.14 && V.bats.length < 3) {
+        V.bats.push({ x: WIN_CX, y: 10, vx: 12 + Math.random() * 14, vy: -2 - Math.random() * 5, ph: Math.random() * 6, life: 5 });
+      }
+    };
+    node.port.onmessage = (e) => {
+      const d = e.data;
+      if (!d || d.t !== 'v') return;
+      V.got = true; V.raw = d.l; V.env = d.e; V.note = d.n; V.ext = d.x;
+      if (d.s !== V.step) { V.step = d.s; onStep(); }
+    };
+    const scene = makeScene();
+
+    function render(dtS, now) {
+      const { buf, rgb, put, blend, stars } = scene;
+      const L = V.lvl, t = now / 1000;
+      const glow = Math.min(1, 0.28 + L * 1.1 + V.env * 0.15) * (V.sleep ? 0.55 : 1);
+      // sky
+      for (let y = 0; y < SH; y++) {
+        const k = y / 48;
+        const c = y < 48 ? rgb(8 + 12 * k, 3 + 4 * k, 14 + 14 * k) : rgb(5, 6, 8);
+        buf.fill(c, y * SW, y * SW + SW);
+      }
+      for (const [x, y, ph, sp] of stars) {
+        const tw = 0.35 + 0.65 * Math.abs(Math.sin(t * sp + ph));
+        blend(x, y, 255, 214, 236, tw * 0.8);
+      }
+      // moon
+      for (let y = 2; y < 20; y++) for (let x = 78; x < 96; x++) {
+        const d1 = Math.hypot(x + 0.5 - 87, y + 0.5 - 10), d2 = Math.hypot(x + 0.5 - 89.6, y + 0.5 - 8.2);
+        if (d1 < 6.2 && d2 > 5.4) put(x, y, rgb(255, 222, 236));
+        else if (d1 < 10) blend(x, y, 255, 160, 200, (10 - d1) * 0.025);
+      }
+      // gothic window
+      for (let y = 0; y <= WIN_BOT; y++) for (let x = WIN_CX - WIN_HW - 1; x <= WIN_CX + WIN_HW + 1; x++) {
+        if (!inWindow(x, y)) continue;
+        const edge = !inWindow(x - 1, y) || !inWindow(x + 1, y) || !inWindow(x, y - 1);
+        if (edge) { put(x, y, rgb(46, 20, 38)); continue; }
+        const dx = (x + 0.5 - WIN_CX) / WIN_HW, dy = (y - 26) / 24;
+        const c = Math.max(0, 1 - Math.sqrt(dx * dx * 0.6 + dy * dy * 0.5)) * glow;
+        const lead = ((x + y) & 3) === 0 || ((x - y) & 3) === 0;
+        const m = lead ? 0.72 : 1;
+        put(x, y, rgb((50 + 205 * c) * m, (12 + 95 * c) * m, (38 + 116 * c) * m));
+      }
+      // tracery: mullion, transom, rose
+      for (let y = 24; y <= WIN_BOT; y++) put(WIN_CX, y, rgb(46, 20, 38));
+      for (let x = WIN_CX - WIN_HW; x <= WIN_CX + WIN_HW; x++) if (inWindow(x, 31)) put(x, 31, rgb(46, 20, 38));
+      for (let a = 0; a < 64; a++) {
+        const an = (a / 64) * 6.283;
+        put(WIN_CX + Math.cos(an) * 4.6, 14 + Math.sin(an) * 4.6, rgb(46, 20, 38));
+        if (a % 8 === 0) put(WIN_CX + Math.cos(an) * 2.4, 14 + Math.sin(an) * 2.4, rgb(46, 20, 38));
+      }
+      put(WIN_CX, 14, rgb(255, 200, 226));
+      // sill + floor
+      for (let x = WIN_CX - 17; x <= WIN_CX + 17; x++) { put(x, 44, rgb(110, 62, 92)); put(x, 45, rgb(58, 30, 48)); }
+      for (let y = 46; y < 48; y++) for (let x = 0; x < SW; x++) put(x, y, rgb(16, 7, 18));
+      // candles
+      const cand = [[68, 9], [75, 12], [82, 7]];
+      cand.forEach(([cx0, hgt], i) => {
+        for (let y = 44 - hgt; y < 46; y++) { put(cx0, y, rgb(236, 220, 230)); put(cx0 + 1, y, rgb(196, 176, 190)); }
+        put(cx0 - 1, 45, rgb(70, 44, 60)); put(cx0 + 2, 45, rgb(70, 44, 60));
+        if (i === 1) put(cx0 + 1, 45 - hgt + 2, rgb(255, 240, 245));
+        const fl = 0.6 + 0.4 * Math.sin(t * 13 + i * 2.1) * Math.sin(t * 7.3 + i);
+        const fy = 44 - hgt - 1, power = 0.45 + V.env * 0.7 + L * 0.5;
+        for (let gy = -6; gy <= 5; gy++) for (let gx = -6; gx <= 6; gx++) {
+          const d = Math.hypot(gx, gy * 1.2);
+          if (d < 6) blend(cx0 + gx, fy + gy, 255, 140, 180, (1 - d / 6) * 0.18 * power * (0.8 + fl * 0.2));
+        }
+        put(cx0, fy, rgb(255, 214, 150)); put(cx0 + 1, fy, rgb(255, 170, 120));
+        if (fl > 0.45 || power > 0.8) put(cx0 + (fl > 0.8 ? 1 : 0), fy - 1, rgb(255, 236, 190));
+        if (power > 0.9) put(cx0, fy - 2, rgb(255, 200, 170));
+      });
+
+      // ── cat
+      const bob = Math.round(V.bob);
+      const breath = V.sleep ? (Math.sin(t * 1.6) > 0.3 ? 1 : 0) : 0;
+      const top = 22 - bob + (V.sleep ? 1 : 0), left = WIN_CX - 9;
+      const tilt = V.sleep ? 0 : V.tilt;
+      const eyesOpen = !V.sleep && V.blink <= 0;
+      const ink = rgb(12, 6, 16);
+      const rimA = 0.55 + glow * 0.45;
+      const rim = rgb(120 * rimA + 40, 36 * rimA + 10, 90 * rimA + 20);
+      const eyeB = 0.55 + Math.min(1, L * 2.2) * 0.45;
+      const mask = new Uint8Array(SW * SH);
+      const cat = (x, y, c) => { x |= 0; y |= 0; if (x < 0 || y < 0 || x >= SW || y >= SH) return; put(x, y, c); mask[y * SW + x] = 1; };
+      CAT.forEach((row, r) => {
+        const dx = r <= 11 ? tilt : 0;
+        const dy = r <= 11 ? breath : 0;                                      // sleeping head rises and falls
+        for (let col = 0; col < row.length; col++) {
+          let ch = row[col];
+          if (ch === '.') continue;
+          // ear flicks: fold the tips
+          if (r < 2 && ((col < 9 && V.earL > 0) || (col > 9 && V.earR > 0))) continue;
+          const x = left + col + dx, y = top + r + dy;
+          let c = ink;
+          if (ch === 'P') c = rgb(170, 52, 110);
+          else if (ch === 'C') c = rgb(224, 56, 122);
+          else if (ch === 'H') c = rgb(255, 214, 232);
+          else if (ch === 'D') c = rgb(40, 18, 34);
+          else if (ch === 'E' || ch === 'K') {
+            const centre = col === 4 || col === 14;
+            if (!eyesOpen) c = r === 7 ? rgb(150, 60, 110) : ink;           // closed lid line
+            else if (ch === 'K') c = L > 0.45 ? rgb(255 * eyeB, 150 * eyeB, 200 * eyeB) : ink; // wide eyes when loud
+            else if (centre && L < 0.15) c = ink;                             // slit pupil when quiet
+            else c = rgb(255 * eyeB, 95 * eyeB, 162 * eyeB);
+          } else if (ch === 'M') {
+            c = V.mouth > 0 ? rgb(255, 156, 198) : rgb(46, 20, 36);
+          }
+          cat(x, y, c);
+        }
+      });
+      // open mouth: little dark-pink square under the nose
+      if (V.mouth > 0) { cat(left + 9 + tilt, top + 10, rgb(110, 14, 52)); cat(left + 9 + tilt, top + 11, rgb(255, 120, 170)); }
+      // tail
+      const sway = V.sleep ? 0.6 : 1 + L * 2.2;
+      const tph = V.tail;
+      let prev = null;
+      for (let i2 = 0; i2 <= 14; i2++) {
+        const u = i2 / 14;
+        const bx = left + 17 + u * 6 + Math.sin(tph + u * 2.6) * u * 2.2 * sway - (u > 0.8 ? (u - 0.8) * 18 : 0);
+        const by = top + 20 - u * 15 + Math.cos(tph * 0.7 + u * 2) * u * 0.8 * sway;
+        const pt = [Math.round(bx), Math.round(by)];
+        cat(pt[0], pt[1], ink);
+        if (u < 0.55) cat(pt[0] + 1, pt[1], ink);
+        if (prev && Math.abs(prev[1] - pt[1]) > 1) cat(pt[0], pt[1] + 1, ink);
+        prev = pt;
+      }
+      // fur bristle when loud and driven
+      if (!V.sleep && L > 0.6 && (P.drive || 0) > 0.5) {
+        const flip = (t * 20) & 1;
+        for (const r of [14, 16, 18]) { cat(left - 0 - flip, top + r, ink); cat(left + 19 + flip, top + r, ink); }
+        cat(left + 6, top + 12 - 1 - flip, ink); cat(left + 12, top + 12 - 1 - flip, ink);
+      }
+      // rim light around the silhouette
+      for (let y = 1; y < SH - 1; y++) for (let x = 1; x < SW - 1; x++) {
+        const i3 = y * SW + x;
+        if (mask[i3]) continue;
+        if (mask[i3 - 1] || mask[i3 + 1] || mask[i3 - SW]) {
+          const inW = inWindow(x, y);
+          blend(x, y, (rim & 255), (rim >> 8) & 255, (rim >> 16) & 255, inW ? 0.35 : 0.85);
+        }
+      }
+      // bats
+      for (const b of V.bats) {
+        const fr = BAT_F[(Math.sin(b.ph) > 0) | 0];
+        fr.forEach((row, r) => { for (let col = 0; col < 5; col++) if (row[col] === 'X') put(b.x - 2 + col, b.y + r, rgb(150, 64, 112)); });
+      }
+      // music notes
+      for (const nt of V.notes) {
+        NOTE_S.forEach((row, r) => { for (let col = 0; col < 3; col++) if (row[col] === 'X') blend(nt.x + col, nt.y + r, 255, 150, 200, Math.min(1, nt.life)); });
+      }
+      // Zzz
+      for (const z of V.zs) {
+        ZED.forEach((row, r) => { for (let col = 0; col < 4; col++) if (row[col] === 'X') blend(z.x + col, z.y + r, 255, 190, 220, Math.min(1, z.life) * 0.9); });
+      }
+      scene.cx.putImageData(scene.img, 0, 0);
+    }
+
+    function tick(dtS, now) {
+      // level smoothing: fast attack, slow release
+      const target = Math.min(1, V.raw * 3.2);
+      V.lvl = target > V.lvl ? V.lvl + (target - V.lvl) * 0.6 : V.lvl * Math.pow(0.08, dtS);
+      if (V.lvl < 0.012) V.quiet += dtS; else { if (V.sleep) { V.startle = 0.4; V.bob = 2.5; V.earL = V.earR = 0; } V.quiet = 0; V.sleep = false; }
+      if (V.quiet > 2.5) V.sleep = true;
+      V.bob = Math.max(0, V.bob - dtS * 9);
+      V.earL = Math.max(0, V.earL - dtS); V.earR = Math.max(0, V.earR - dtS);
+      V.mouth = Math.max(0, V.mouth - dtS);
+      V.nextBlink -= dtS;
+      if (V.nextBlink <= 0) { V.blink = 0.13; V.nextBlink = 2.5 + Math.random() * 3.5; }
+      V.blink = Math.max(0, V.blink - dtS);
+      const bpm = P.rate || 110;
+      V.tail += dtS * (V.sleep ? 1.2 : 2 + (bpm / 60) * (0.6 + V.lvl * 1.5));
+      if (!V.sleep && V.lvl < 0.05) V.tilt = 0;
+      for (const b of V.bats) { b.x += b.vx * dtS; b.y += (b.vy + Math.sin(b.ph * 0.5) * 3) * dtS; b.ph += dtS * 18; b.life -= dtS; }
+      V.bats = V.bats.filter((b) => b.life > 0 && b.x < SW + 4 && b.y > -4);
+      for (const nt of V.notes) { nt.x += nt.vx * dtS; nt.y += nt.vy * dtS; nt.life -= dtS; }
+      V.notes = V.notes.filter((nt) => nt.life > 0);
+      if (V.sleep) {
+        V.zT -= dtS;
+        if (V.zT <= 0) { V.zs.push({ x: WIN_CX + 8, y: 22, life: 2.2 }); V.zT = 1.1; }
+      }
+      for (const z of V.zs) { z.x += dtS * 3; z.y -= dtS * 5; z.life -= dtS; }
+      V.zs = V.sleep ? V.zs.filter((z) => z.life > 0) : [];
+    }
+
+    return {
+      inputs: ins,
+      outputs: { outL, outR, env },
+      setParam(id, value) {
+        P[id] = value;
+        node.port.postMessage({ t: 'p', id, v: value });
+      },
+      onConnect(portId, connected, kind) {
+        if (kind === 'in' && (portId === 'voct' || portId === 'gate' || portId === 'clock')) {
+          node.port.postMessage({ t: 'c', id: portId, v: !!connected });
+        }
+      },
+      draw(g, w, h) {
+        const now = performance.now();
+        const dtS = Math.min(0.1, Math.max(0, (now - V.last) / 1000));
+        V.last = now;
+        if (!V.got || (api.isRunning && !api.isRunning())) V.raw = 0;
+        tick(dtS, now);
+        render(dtS, now);
+        g.save();
+        g.imageSmoothingEnabled = false;
+        g.drawImage(scene.cv, 0, 0, w, h);
+        // eye glow (only lit things glow)
+        if (!V.sleep && V.blink <= 0 && V.lvl > 0.05) {
+          const sx = w / SW, sy = h / SH;
+          const ey = (22 - Math.round(V.bob) + 7.5) * sy;
+          g.globalCompositeOperation = 'lighter';
+          for (const ex of [WIN_CX - 9 + 4.5 + V.tilt, WIN_CX - 9 + 14.5 + V.tilt]) {
+            const r = 7 * sx;
+            const gr = g.createRadialGradient(ex * sx, ey, 0, ex * sx, ey, r);
+            gr.addColorStop(0, `rgba(255,107,154,${Math.min(0.55, V.lvl * 0.7)})`);
+            gr.addColorStop(1, 'rgba(255,107,154,0)');
+            g.fillStyle = gr; g.fillRect(ex * sx - r, ey - r, r * 2, r * 2);
+          }
+          g.globalCompositeOperation = 'source-over';
+        }
+        // status line
+        g.font = '600 8.5px "Barlow Semi Condensed", sans-serif';
+        g.textBaseline = 'alphabetic';
+        const yb = h - (h / SH) * 2;
+        g.fillStyle = 'rgba(255,255,255,0.7)';
+        g.textAlign = 'left';
+        let left;
+        if (!V.got || (api.isRunning && !api.isRunning())) left = 'ZZZ · START AUDIO TO WAKE ME';
+        else if (api.isAudible && !api.isAudible()) left = 'PATCH OUT L/R TO LINE OUT';
+        else if (V.sleep) left = 'ZZZ...';
+        else left = `${noteName(V.note)}  ${P.arp >= 0.5 ? CHORD_N[Math.round(P.chord || 0)] + ' ' + MODE_N[Math.round(P.mode || 0)] : 'ROOT'}`;
+        g.fillText(left, 4, yb);
+        g.textAlign = 'right';
+        g.fillStyle = '#ff6b9a';
+        const right = P.arp >= 0.5 ? (V.ext ? 'EXT CLOCK' : Math.round(P.rate || 110) + ' BPM') : 'ARP OFF';
+        if (V.got && left.length < 16) g.fillText(right, w - 4, yb);
+        // level pips
+        const n = Math.round(V.lvl * 8);
+        for (let i = 0; i < 8; i++) {
+          g.fillStyle = i < n ? '#ff6b9a' : 'rgba(255,107,154,0.18)';
+          g.fillRect(w / 2 + 14 + i * 4, yb - 5, 3, 4);
+        }
+        g.restore();
+      },
+      destroy() {
+        node.port.postMessage('__rack_dispose');
+        node.port.onmessage = null;
+        try { node.disconnect(); } catch (e) {}
+        for (const g of [...Object.values(ins), outL, outR, env, keep]) { try { g.disconnect(); } catch (e) {} }
+      },
+    };
+  },
+};
